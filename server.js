@@ -523,6 +523,10 @@ if (fs.existsSync(CAT_FILE)) {
   }
 }
 
+server.on('error', (e) => {
+  console.error(`Could not listen on :${PORT} — ${e.code === 'EADDRINUSE' ? 'something is already using that port' : e.message}.`);
+  process.exit(1);
+});
 server.listen(PORT, () => {
   console.log(`TCG Card API on http://localhost:${PORT}`);
   console.log(`Data directory: ${DATA_DIR}`);

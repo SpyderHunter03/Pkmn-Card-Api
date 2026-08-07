@@ -105,6 +105,10 @@ const mockSrc = http.createServer((req, res) => {
   }
   res.writeHead(404); res.end('nope');
 });
+mockSrc.on('error', (e) => {
+  console.error(`The mock master could not listen on :${SRC_PORT} (${e.code}) — a previous run may still be alive.`);
+  process.exit(1);
+});
 
 let AUTH = null;   // the token most checks ride on; set once the CLI has minted it
 const j = async (pathAndQuery, port = API_PORT, opts = {}) => {
@@ -323,8 +327,12 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
     (await j('/v1/nothing-here')).status === 404);
 
   /* ---- the ledger survives what the burst window is allowed to forget ---- */
-  children[1].kill();                                    // the gated API; api2 stays up
-  await new Promise((r) => setTimeout(r, 300));
+  const gated = children[1];                             // the gated API; api2 stays up
+  gated.kill();
+  // kill() only asks — wait for the exit, or on Windows the new instance can
+  // find the port still held by the old one's ghost
+  await new Promise((r) => { if (gated.exitCode !== null) return r(); gated.once('exit', r); });
+  await new Promise((r) => setTimeout(r, 200));
   startApi(API_PORT, apiData, `http://localhost:${SRC_PORT}`);
   check('a restarted API still holds its catalog (the mock is dead by now)',
     await until(async () => (await j('/v1/health', API_PORT, { noAuth: true })).body.catalog === true));
@@ -334,8 +342,25 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
   check('while the tiny token is still spent, not refreshed by a reboot',
     (await j('/v1/cards/base1-4?lang=en', API_PORT, { headers: { Authorization: 'Bearer ' + tokTiny } })).status === 402);
 
+  /* ---- cleanup, the Windows way ----
+   * kill() only ASKS a child to die, and Windows refuses to delete files a
+   * living process still holds open — so removing the temp dir straight
+   * after the kills is a race the sandbox's Linux always won and a real
+   * Windows box promptly lost. Wait for every child to actually exit, retry
+   * the removal (SQLite's file locks can outlive the process by a beat),
+   * and never let the janitor fail a suite the checks passed: a leftover
+   * temp dir is the OS temp cleaner's problem, not a test failure. */
   for (const c of children) c.kill();
-  fs.rmSync(TMP, { recursive: true, force: true });
+  await Promise.all(children.map((c) => new Promise((r) => {
+    if (c.exitCode !== null) return r();
+    c.once('exit', r);
+    setTimeout(r, 3000);       // a stuck child must not hang the suite either
+  })));
+  try {
+    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {
+    console.log(`(left ${TMP} behind — the temp cleaner will take it)`);
+  }
   console.log(failCount ? `${failCount} check(s) FAILED` : 'All checks passed.');
   process.exit(failCount ? 1 : 0);
 })().catch((e) => {
