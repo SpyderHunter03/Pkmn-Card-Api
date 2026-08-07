@@ -185,11 +185,12 @@ Accuracy is stated honestly: enforcement is exact within one sync interval
 own request rate, once, at the boundary — the price of keeping every request
 local instead of adding a cross-country round trip to each one.
 
-[deploy/DEPLOY.md](deploy/DEPLOY.md) is the copy-paste runbook for the real
-thing: two Vultr boxes (east + west US), one Cloudflare Tunnel with a
-replica connector on each — Cloudflare is the proxy between them, no
-load-balancer product and no open inbound ports — and a smoke test that
-proves the cluster the same way the suite does.
+[deploy/DEPLOY.md](deploy/DEPLOY.md) is the copy-paste runbook: one Vultr
+box first (a complete deployment on its own, tunneled through Cloudflare),
+then nodes added one at a time — each new box is a replica connector on the
+same tunnel, so Cloudflare is the proxy between them with no load-balancer
+product and no open inbound ports — ending in a smoke test that proves the
+cluster the same way the suite does.
 
 ## What is deliberately not here yet
 
