@@ -281,6 +281,13 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
     (await bursty('/v1/me')).status === 403);
   check('the ledger shows names, plans and spend',
     /Tiny allowance/.test(cli(apiData, ['list'])) && /REVOKED/.test(cli(apiData, ['list'])));
+  check('every CLI command says which ledger file it opened',
+    cli(apiData, ['list']).includes(path.join(apiData, 'api.db')));
+  // the value in your hand is the value you want dead — no id lookup required
+  const tokByVal = mint(apiData, ['issue', '--name', 'Revoked by its own value', '--plan', 'starter']);
+  cli(apiData, ['revoke', tokByVal]);
+  check('revoke accepts the raw token value itself',
+    (await j('/v1/me', API_PORT, { headers: { Authorization: 'Bearer ' + tokByVal } })).status === 403);
 
   /* ---- the bulk file: byte-for-byte, tombstones included ---- */
   const dbRes = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`, { headers: { Authorization: 'Bearer ' + AUTH } });

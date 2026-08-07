@@ -139,9 +139,18 @@ ssh WEST_IP 'curl -s -H "Authorization: Bearer '$T'" http://localhost:3400/v1/me
 curl -s -H "Authorization: Bearer $T" https://api.yourdomain.com/v1/health
 ```
 
-Revocation is the same everywhere: `tokens.js revoke <id>` on either box is
-enforced by both within a sync interval. Mint on whichever box is closer;
-keys replicate.
+Revocation is the same everywhere, and the CLI takes the token value itself:
+
+```bash
+sudo -u cardapi DATA_DIR=/var/lib/card-api node scripts/tokens.js revoke ptcg_live_...
+```
+
+Enforced by both boxes within a sync interval. Mint on whichever box is
+closer; keys replicate. Two habits worth keeping: always set `DATA_DIR` so
+the CLI opens the service's ledger and not the repo-default `./data` (every
+command prints which file it opened, so a mistake announces itself), and run
+it as the service user — a root-owned SQLite sidecar file in the service's
+directory is a fine way to break the service's next write.
 
 ## 7. Updating
 

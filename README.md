@@ -68,6 +68,12 @@ node scripts/tokens.js list
 node scripts/tokens.js revoke 3        # takes effect on their next request
 ```
 
+The CLI operates on the ledger at `DATA_DIR` (default `./data`) and prints
+which file it opened — on a deployed box, set `DATA_DIR` to match the
+service's env file or you will be confidently inspecting an empty database.
+`revoke`/`show`/`restore` accept the id from `list`, the raw token value, or
+a unique prefix.
+
 Only the SHA-256 of a token is stored — the raw value is shown once, at
 issue. Plans pair a **monthly allowance** (requests per calendar month, UTC)
 with a **per-minute burst cap**; `unlimited` skips the allowance but keeps

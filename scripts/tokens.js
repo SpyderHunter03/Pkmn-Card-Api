@@ -16,11 +16,18 @@
 'use strict';
 
 const path = require('path');
-const { PLANS, openApiDb, sha256, newToken, period, writeStamp } = require(path.join(__dirname, '..', 'lib', 'apidb'));
+const { PLANS, openApiDb, sha256, newToken, TOKEN_RE, period, writeStamp } = require(path.join(__dirname, '..', 'lib', 'apidb'));
 
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 require('fs').mkdirSync(DATA_DIR, { recursive: true });
 const db = openApiDb(DATA_DIR);
+
+/* Which ledger this is, said out loud on every command. There are two
+ * plausible ones on a deployed box — the service's DATA_DIR and the repo's
+ * default ./data — and a CLI that silently opens the wrong one reports an
+ * empty world with total confidence. */
+console.log(`ledger: ${path.join(DATA_DIR, 'api.db')}${process.env.DATA_DIR ? '' : '   (default — the service may use another; set DATA_DIR to match its env file)'}`);
+console.log('');
 
 const args = process.argv.slice(2);
 const cmd = args.shift();
@@ -74,18 +81,31 @@ if (cmd === 'list') {
 }
 
 if (cmd === 'show' || cmd === 'revoke' || cmd === 'restore') {
-  const id = parseInt(args[0], 10);
-  const t = Number.isInteger(id) ? db.prepare('SELECT * FROM tokens WHERE id = ?').get(id) : null;
-  if (!t) fail('No token with that id — `list` shows them.');
+  /* Accept whatever the operator is actually holding: the numeric id from
+   * `list`, the raw token value (hashed and matched — the value you want
+   * dead is the value in your hand), or enough of its prefix to be unique. */
+  const ref = String(args[0] || '').trim();
+  let t = null;
+  if (/^\d+$/.test(ref)) {
+    t = db.prepare('SELECT * FROM tokens WHERE id = ?').get(parseInt(ref, 10));
+  } else if (TOKEN_RE.test(ref)) {
+    t = db.prepare('SELECT * FROM tokens WHERE hash = ?').get(sha256(ref));
+  } else if (/^ptcg_live_[0-9a-f]{2,}$/.test(ref)) {
+    const hits = db.prepare('SELECT * FROM tokens WHERE prefix LIKE ?').all(ref.slice(0, 16) + '%')
+      .filter((row) => row.prefix.startsWith(ref.slice(0, 16)) || ref.startsWith(row.prefix));
+    if (hits.length > 1) fail('That prefix matches more than one token — use the id from `list`.');
+    t = hits[0] || null;
+  }
+  if (!t) fail('No such token in THIS ledger (see the path above) — `list` shows what is here, and the service may be using a different DATA_DIR.');
   if (cmd === 'revoke') {
-    db.prepare('UPDATE tokens SET revoked = 1, updated = ? WHERE id = ?').run(writeStamp(t.updated), id);
-    console.log(`#${id} "${t.name}" is revoked. Every request it makes from now on gets 403` +
+    db.prepare('UPDATE tokens SET revoked = 1, updated = ? WHERE id = ?').run(writeStamp(t.updated), t.id);
+    console.log(`#${t.id} "${t.name}" is revoked. Every request it makes from now on gets 403` +
       ' - on every node, once the peers have exchanged.');
   } else if (cmd === 'restore') {
-    db.prepare('UPDATE tokens SET revoked = 0, updated = ? WHERE id = ?').run(writeStamp(t.updated), id);
-    console.log(`#${id} "${t.name}" works again.`);
+    db.prepare('UPDATE tokens SET revoked = 0, updated = ? WHERE id = ?').run(writeStamp(t.updated), t.id);
+    console.log(`#${t.id} "${t.name}" works again.`);
   } else {
-    const used = db.prepare('SELECT count FROM usage WHERE token_id = ? AND period = ?').get(id, period());
+    const used = db.prepare('SELECT count FROM usage WHERE token_id = ? AND period = ?').get(t.id, period());
     console.log(JSON.stringify({ ...t, hash: undefined, usedThisPeriod: (used && used.count) || 0 }, null, 2));
   }
   process.exit(0);
