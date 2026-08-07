@@ -44,6 +44,10 @@ CARD_SOURCE_URL=https://pub-xxxx.r2.dev PORT=3400 node server.js
 | `CARD_SOURCE_URL` | base URL of the published master (the tracker calls this `cdnBase`) | — |
 | `CARD_CHECK_INTERVAL_MS` | how often to look for a newer master | 6 hours |
 | `CARD_REQUIRE_TOKEN` | `0` runs the surface open (local dev) | on |
+| `CARD_PUBLIC_URL` | this API's public base; makes JSON image URLs absolute | — |
+| `IMAGES_ENABLED` | `0` removes all artwork from the API's answers | on |
+| `CARD_IMAGE_URL_TTL` | seconds a presigned image URL lives | `300` |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` / `R2_ENDPOINT` | bucket credentials for presigned URLs (same names as `publish-images.js`) | — |
 
 Or Docker: `docker build -t tcg-card-api . && docker run -p 3400:3400 -e CARD_SOURCE_URL=… -v carddata:/data tcg-card-api`
 
@@ -99,6 +103,46 @@ column is what each answer subtracts from the monthly allowance.
 | `/v1/cards/base1-4?lang=en` | 1 | one card |
 | `/v1/cards?lang=en&name=char&rarity=…&type=…&set=…&page=1&perPage=100` | 1 | search |
 | `/v1/scan-index?lang=en` | 5 | the offline scanner's perceptual-hash index |
+| `/v1/images/<path>` | 0 | a 302 to where the image bytes actually live — see Images |
+
+## Images
+
+Image locations in served JSON point at this API (`/v1/images/…`; set
+`CARD_PUBLIC_URL` and they become absolute). Asking for one gets a **302 to
+where the bytes actually live** — never the bytes themselves, so image
+traffic costs this host a header, not a body:
+
+- With bucket credentials configured (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` — the same names `publish-images.js`
+  uses, so an existing `r2.env` works verbatim), the redirect is a
+  **presigned URL**, host-bound and valid for `CARD_IMAGE_URL_TTL` seconds
+  (default 300). This is what lets the bucket go private.
+- Without credentials, the redirect points at the public bucket — so this
+  phase deploys today, before anything about the bucket changes.
+
+**Images cost 0 against every plan, including free, forever.** That is
+standing policy (PLAN.md), not pricing: the artwork is never part of anything
+paid. The per-minute burst cap still applies — it protects the host, not the
+ledger. A token whose monthly allowance is spent can still fetch images.
+
+An image hosted somewhere other than the master bucket is not ours to gate;
+its URL passes through untouched.
+
+**Browser clients:** an `<img>` tag cannot carry a Bearer header. The
+intended pattern is one hop server-side — your backend (which holds the
+token) requests `/v1/images/…`, gets the 302, and hands the short-lived
+signed URL to the browser. The bytes then flow bucket → browser directly.
+
+**The severability switch:** `IMAGES_ENABLED=0` removes the artwork from
+this API's answers entirely — the endpoint answers 404 and every image field
+in the JSON becomes null, because an address is distribution too. The card
+data is untouched. This exists so a takedown request can be complied with in
+one config change, without harming the data product.
+
+Note that `/v1/catalog.db` is byte-for-byte the published file, so image
+locations *inside it* still point at the bucket — consumer installs that
+mirror the database handle their own image serving (that is Phase 4's
+concern, not this endpoint's).
 
 Deleted cards are tombstones in the database (that is how consumer installs
 learn about deletions), but this API never serves a tombstone as if it were a
@@ -107,10 +151,11 @@ tombstones because the pull protocol needs them.
 
 ## What is deliberately not here yet
 
-Image URLs served through the API (Phase 3 — signed bucket redirects, free on
-every plan by standing policy) and any payment integration (Phase 5, which
-will be a webhook onto the same provisioning code the CLI uses). See
-[PLAN.md](PLAN.md) for the staging and the reasoning.
+Payment integration (Phase 5, which will be a webhook onto the same
+provisioning code the CLI uses) — and the bucket itself stays public until
+the tracker has become a client of this API (Phase 4), because making it
+private earlier would break every install that still pulls from it directly.
+See [PLAN.md](PLAN.md) for the staging and the reasoning.
 
 ## A note on what this serves
 

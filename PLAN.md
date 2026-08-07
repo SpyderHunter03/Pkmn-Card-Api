@@ -87,9 +87,10 @@ boot pull plus updates. The tracker's out-of-the-box install story survives.
 2. **Tokens, plans, quotas** — ✅ done. The gate is in front, requests are
    weighted, refusals explain themselves, the ledger survives restarts, and
    scripts/tokens.js mints, lists and revokes.
-3. **Images** — metered-at-zero image endpoint answering with short-lived
-   signed bucket URLs (bytes go Cloudflare → client, never through this
-   host); card JSON rewritten to point at the API; `IMAGES_ENABLED` switch.
+3. **Images** — ✅ done. /v1/images answers with a 302 — presigned and
+   short-lived once bucket credentials exist, the public bucket until then —
+   card JSON points at the API, external URLs pass through untouched, cost
+   is 0 on every plan, and IMAGES_ENABLED=0 removes the artwork entirely.
 4. **The tracker becomes a client** — token in setup + admin, catalog pull
    and images rerouted, honest failure messages for missing/revoked/spent.
    Only after this ships everywhere does the bucket go private.

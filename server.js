@@ -16,6 +16,14 @@
  * lookup — and every answer carries X-Quota-* / X-RateLimit-* headers so a
  * client sees the wall before hitting it. scripts/tokens.js mints the keys.
  *
+ * Phase 3: images, by address. Image locations in served JSON point at this
+ * API, and /v1/images answers with a 302 to where the bytes actually live —
+ * a presigned bucket URL when credentials are configured, the public bucket
+ * until then — so image bytes go Cloudflare → client and never cross this
+ * host. Image requests cost 0 against every plan, forever: that is standing
+ * policy (PLAN.md), not pricing. IMAGES_ENABLED=0 removes the artwork from
+ * the API's answers entirely, in one move, without touching the data.
+ *
  * Env:
  *   PORT                    listen port (default 3400)
  *   DATA_DIR                where the pulled catalog + this service's own
@@ -26,6 +34,17 @@
  *                           (default 6 hours)
  *   CARD_REQUIRE_TOKEN      set to 0 to run the surface open (local
  *                           development; the default is on)
+ *   CARD_PUBLIC_URL         this API's own public base; set it and image
+ *                           locations in JSON become absolute URLs
+ *   CARD_IMAGE_URL_TTL      seconds a presigned image URL stays valid
+ *                           (default 300)
+ *   IMAGES_ENABLED          set to 0 and this API hands out no artwork at
+ *                           all — the severability switch
+ *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET,
+ *   R2_ENDPOINT             bucket credentials for presigned URLs — the same
+ *                           names publish-images.js uses, so an existing
+ *                           r2.env works verbatim. Without them, image
+ *                           redirects point at the public bucket.
  *
  * Zero dependencies. Node >= 22.5 (node:sqlite).
  */
@@ -48,6 +67,18 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data
 const SOURCE = (process.env.CARD_SOURCE_URL || '').trim().replace(/\/+$/, '');
 const CHECK_MS = parseInt(process.env.CARD_CHECK_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
 const REQUIRE_TOKEN = process.env.CARD_REQUIRE_TOKEN !== '0';
+const IMAGES_ENABLED = process.env.IMAGES_ENABLED !== '0';
+const PUBLIC_URL = (process.env.CARD_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+const IMG_TTL = Math.max(60, parseInt(process.env.CARD_IMAGE_URL_TTL || '300', 10) || 300);
+const R2 = {
+  account: (process.env.R2_ACCOUNT_ID || '').trim(),
+  key: (process.env.R2_ACCESS_KEY_ID || '').trim(),
+  secret: (process.env.R2_SECRET_ACCESS_KEY || '').trim(),
+  bucket: (process.env.R2_BUCKET || '').trim(),
+  endpoint: (process.env.R2_ENDPOINT || '').trim().replace(/\/+$/, ''),
+};
+const R2_SIGNED = !!(R2.key && R2.secret && R2.bucket && (R2.account || R2.endpoint));
+const crypto = require('crypto');
 
 const CAT_FILE = path.join(DATA_DIR, 'catalog.db');
 const CAT_TMP = CAT_FILE + '.tmp';
@@ -145,12 +176,42 @@ function gate(req, res, cost) {
  * can poll for updates without spending, and images (Phase 3) are free
  * forever — that one is policy, not economics; see PLAN.md. */
 function costOf(p, req) {
+  if (p.startsWith('/v1/images/')) return 0;   // policy, not economics — PLAN.md
   if (p === '/v1/catalog.db') return req.headers['if-none-match'] === currentEtag() ? 0 : 100;
   if (p === '/v1/scan-index') return 5;
   if (p === '/v1/catalog.json' || p === '/v1/languages' || p === '/v1/me') return 0;
   if (p === '/v1/sets' || p.startsWith('/v1/sets/') || p === '/v1/cards' || p.startsWith('/v1/cards/')) return 1;
   return 0;                     // unknown paths get a 404, not a bill
 }
+
+/* A presigned GET on the bucket: SigV4 in the query string, host-bound,
+ * short-lived. Same zero-dependency signing publish-images.js does for
+ * uploads, in its query-parameter form. Region is 'auto' — that is R2's. */
+function presignGet(key) {
+  const endpoint = R2.endpoint || `https://${R2.account}.r2.cloudflarestorage.com`;
+  const host = new URL(endpoint).host;
+  const amzDate = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const date = amzDate.slice(0, 8);
+  const scope = `${date}/auto/s3/aws4_request`;
+  const pathName = `/${R2.bucket}/${key}`.split('/').map(encodeURIComponent).join('/');
+  const enc = (v) => encodeURIComponent(v).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const query = [
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', `${R2.key}/${scope}`],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(IMG_TTL)],
+    ['X-Amz-SignedHeaders', 'host'],
+  ].map(([k, v]) => `${enc(k)}=${enc(v)}`).sort().join('&');
+  const canonical = ['GET', pathName, query, `host:${host}\n`, 'host', 'UNSIGNED-PAYLOAD'].join('\n');
+  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(canonical)].join('\n');
+  const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+  const sig = crypto.createHmac('sha256',
+    hmac(hmac(hmac(hmac('AWS4' + R2.secret, date), 'auto'), 's3'), 'aws4_request'))
+    .update(toSign).digest('hex');
+  return `${endpoint}${pathName}?${query}&X-Amz-Signature=${sig}`;
+}
+
+const IMG_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]*\.(webp|png|jpe?g)$/;
 
 function currentEtag() {
   return `"v${state.manifest ? state.manifest.version : 0}-${((state.manifest && state.manifest.contentHash) || '').slice(0, 16)}"`;
@@ -243,6 +304,17 @@ function langOf(url) {
   return LANG_RE.test(lang) ? lang : null;
 }
 
+/* An image location leaves this API pointing AT this API. Locations under
+ * the master bucket are rewritten to /v1/images/…; a location hosted
+ * anywhere else is not ours to gate and passes through untouched. With
+ * images switched off, nothing is handed out at all — an address is
+ * distribution too. */
+function apiImage(u) {
+  if (!u || !IMAGES_ENABLED) return null;
+  if (SOURCE && u.startsWith(SOURCE + '/')) return PUBLIC_URL + '/v1/images/' + u.slice(SOURCE.length + 1);
+  return u;
+}
+
 function cardJson(c, prints) {
   const live = (prints || []).filter((p) => !p.hidden);
   const dead = new Set((prints || []).filter((p) => p.hidden).map((p) => p.variant));
@@ -261,11 +333,11 @@ function cardJson(c, prints) {
     hp: c.hp ?? null,
     illustrator: c.illustrator || null,
     variants: [...variants],
-    images: { low: c.img_low || null, high: c.img_high || null },
+    images: { low: apiImage(c.img_low), high: apiImage(c.img_high) },
     printings: live.map((p) => ({
       variant: p.variant,
       label: p.label || null,
-      images: { low: p.img_low || null, high: p.img_high || null },
+      images: { low: apiImage(p.img_low), high: apiImage(p.img_high) },
     })),
   };
 }
@@ -276,7 +348,7 @@ function setSummaryJson(s, n) {
     id: s.id,
     name: s.name,
     releaseDate: s.release_date || null,
-    logo: s.logo || null,
+    logo: apiImage(s.logo),
     cardCount: { official, total: Math.max(n, official) },
   };
 }
@@ -448,6 +520,31 @@ const server = http.createServer(async (req, res) => {
         'Access-Control-Allow-Origin': '*',
       });
       return fs.createReadStream(CAT_FILE).pipe(res);
+    }
+
+    /* ---- images: an address, never bytes ----
+     * The answer is a redirect to where the bytes actually live, so image
+     * traffic costs this host a header, not a body. Free on every plan by
+     * standing policy; the burst cap is the only wall, and it is there for
+     * the host, not the ledger. */
+    const imgMatch = p.match(/^\/v1\/images\/(.+)$/);
+    if (imgMatch) {
+      if (!IMAGES_ENABLED) {
+        return sendJSON(res, 404, { error: 'Images are switched off on this install. The card data is unaffected.' });
+      }
+      const key = decodeURIComponent(imgMatch[1]);
+      if (!IMG_KEY_RE.test(key) || key.includes('..') || key.includes('//')) {
+        return sendJSON(res, 400, { error: 'That does not look like an image path' });
+      }
+      const target = R2_SIGNED ? presignGet(key) : (SOURCE ? `${SOURCE}/${key}` : null);
+      if (!target) return sendJSON(res, 503, { error: 'No image source is configured on this install.' });
+      res.writeHead(302, {
+        Location: target,
+        // the redirect must not outlive the signature it points at
+        'Cache-Control': `private, max-age=${Math.min(60, IMG_TTL)}`,
+        'Access-Control-Allow-Origin': '*',
+      });
+      return res.end();
     }
 
     if (!cat && p.startsWith('/v1/')) return noCatalog(res);

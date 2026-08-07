@@ -22,6 +22,9 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'card-api-test-'));
 const SRC_PORT = 3490;
 const API_PORT = 3491;
 const API2_PORT = 3492;
+const IMGOFF_PORT = 3493;
+const SIGNED_PORT = 3494;
+const IMG = `http://localhost:${SRC_PORT}`;   // fixture image URLs live under the mock master
 
 /* ---- fixture: a published catalog.db, exactly as the publisher writes it ---- */
 const SCHEMA = `
@@ -52,15 +55,15 @@ function buildFixture(file, { withNewCard = false } = {}) {
   db.exec('PRAGMA journal_mode=DELETE');
   db.exec(SCHEMA);
   const set = db.prepare('INSERT INTO sets (lang,id,name,release_date,logo,official_count,position,hidden) VALUES (?,?,?,?,?,?,?,?)');
-  set.run('en', 'base1', 'Base Set', '1999-01-09', 'https://cdn.test/base1-logo.png', 102, 0, 0);
+  set.run('en', 'base1', 'Base Set', '1999-01-09', `${IMG}/en/images/base1/logo.webp`, 102, 0, 0);
   set.run('en', 'fossil', 'Fossil', '1999-10-10', null, 62, 1, 0);
   set.run('en', 'ghost', 'Removed Set', null, null, 10, 2, 1);     // tombstone
   set.run('fr', 'base1', 'Set de Base', '1999-01-09', null, 102, 0, 0);
   const card = db.prepare('INSERT INTO cards (lang,id,set_id,local_id,name,rarity,category,dex_csv,types_csv,hp,illustrator,variants_csv,img_low,img_high,position,hidden) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
   card.run('en', 'base1-4', 'base1', '4', 'Charizard', 'Rare Holo', 'Pokemon', '6', 'Fire', 120, 'Mitsuhiro Arita',
-    'normal,holo', 'https://cdn.test/base1/4/low.webp', 'https://cdn.test/base1/4/high.webp', 0, 0);
+    'normal,holo', `${IMG}/en/images/base1/4/low.webp`, `${IMG}/en/images/base1/4/high.webp`, 0, 0);
   card.run('en', 'base1-7', 'base1', '7', 'Squirtle', 'Common', 'Pokemon', '7', 'Water', 40, null,
-    'normal', 'https://cdn.test/base1/7/low.webp', null, 1, 0);
+    'normal', `${IMG}/en/images/base1/7/low.webp`, 'https://elsewhere.test/sq-high.webp', 1, 0);
   card.run('en', 'base1-99', 'base1', '99', 'Deleted Card', 'Common', 'Pokemon', null, null, null, null,
     'normal', null, null, 2, 1);                                    // tombstone
   card.run('en', 'fossil-1', 'fossil', '1', 'Aerodactyl', 'Rare Holo', 'Pokemon', '142', 'Fighting', 60, null,
@@ -72,7 +75,7 @@ function buildFixture(file, { withNewCard = false } = {}) {
       'normal', null, null, 1, 0);
   }
   const pr = db.prepare('INSERT INTO printings (lang,card_id,variant,label,img_low,img_high,hidden) VALUES (?,?,?,?,?,?,?)');
-  pr.run('en', 'base1-4', 'cracked-ice-holo', 'Cracked Ice Holo', 'https://cdn.test/base1/4/cih.webp', null, 0);
+  pr.run('en', 'base1-4', 'cracked-ice-holo', 'Cracked Ice Holo', `${IMG}/en/images/base1/4/cih.webp`, null, 0);
   pr.run('en', 'fossil-1', 'holo', null, null, null, 1);            // this variant is withdrawn
   db.prepare('INSERT INTO meta (key,value) VALUES (?,?)').run('schema', '1');
   db.close();
@@ -98,6 +101,10 @@ const mockSrc = http.createServer((req, res) => {
     if (master.corrupt) { res.writeHead(200); return res.end('this is not a sqlite file at all'); }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
     return fs.createReadStream(master.dbFile).pipe(res);
+  }
+  if (/^\/en\/images\/.+\.webp$/.test(u.pathname)) {
+    res.writeHead(200, { 'Content-Type': 'image/webp' });
+    return res.end('WEBP-BYTES:' + u.pathname);
   }
   if (u.pathname === '/en/scan-index.json') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -130,7 +137,7 @@ const until = async (fn, ms = 8000) => {
 };
 
 const children = [];
-function startApi(port, dataDir, source, { noAuth = false } = {}) {
+function startApi(port, dataDir, source, { noAuth = false, env = {} } = {}) {
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
     env: {
       ...process.env,
@@ -139,6 +146,7 @@ function startApi(port, dataDir, source, { noAuth = false } = {}) {
       CARD_SOURCE_URL: source,
       CARD_CHECK_INTERVAL_MS: '300',
       CARD_REQUIRE_TOKEN: noAuth ? '0' : '1',
+      ...env,
     },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
@@ -199,7 +207,7 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
   check('a card carries the fields a client needs',
     zard.name === 'Charizard' && zard.number === '4' && zard.rarity === 'Rare Holo' &&
     zard.dex[0] === 6 && zard.types[0] === 'Fire' && zard.hp === 120 &&
-    zard.images.low === 'https://cdn.test/base1/4/low.webp');
+    zard.images.low === '/v1/images/en/images/base1/4/low.webp');
   check('custom printings ride along with their labels',
     zard.printings.length === 1 && zard.printings[0].label === 'Cracked Ice Holo' &&
     zard.variants.includes('cracked-ice-holo'));
@@ -296,6 +304,77 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
   check('a second pull does not fit in what is left', (await puller('/v1/catalog.db')).status === 402);
   check('but "you already have it" is free even to a broke token',
     (await puller('/v1/catalog.db', { 'If-None-Match': etag })).status === 304);
+
+  /* ---- images: addresses out, bytes never through ---- */
+  const zardImg = (await j('/v1/cards/base1-4?lang=en')).body;
+  check('image locations point back at the API, printings included',
+    zardImg.images.high === '/v1/images/en/images/base1/4/high.webp' &&
+    zardImg.printings[0].images.low === '/v1/images/en/images/base1/4/cih.webp');
+  check('the set logo is rewritten the same way',
+    (await j('/v1/sets?lang=en')).body.sets[0].logo === '/v1/images/en/images/base1/logo.webp');
+  check('an image hosted somewhere else is not ours to gate, and passes through',
+    (await j('/v1/cards/base1-7?lang=en')).body.images.high === 'https://elsewhere.test/sq-high.webp');
+
+  const imgUrl = `http://localhost:${API_PORT}/v1/images/en/images/base1/4/low.webp`;
+  const img = await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + AUTH }, redirect: 'manual' });
+  check('an image answer is an address, not bytes',
+    img.status === 302 && img.headers.get('location') === `${IMG}/en/images/base1/4/low.webp`);
+  const followed = await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + AUTH } });
+  check('and following it lands where the bytes actually live',
+    followed.status === 200 && (await followed.text()).startsWith('WEBP-BYTES:'));
+
+  check('an image still wants a token', (await fetch(imgUrl, { redirect: 'manual' })).status === 401);
+  const brokeImg = await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + tokTiny }, redirect: 'manual' });
+  check('a token with nothing left this month can still see pictures — images cost 0, by policy',
+    brokeImg.status === 302 && brokeImg.headers.get('x-quota-remaining') === '0');
+  const tokImg = mint(apiData, ['issue', '--name', 'Image burster', '--plan', 'unlimited', '--burst', '2']);
+  await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + tokImg }, redirect: 'manual' });
+  await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + tokImg }, redirect: 'manual' });
+  check('but the burst cap still stands — it protects the host, not the ledger',
+    (await fetch(imgUrl, { headers: { Authorization: 'Bearer ' + tokImg }, redirect: 'manual' })).status === 429);
+
+  check('a path that is not an image is refused',
+    (await j('/v1/images/en/secrets.txt')).status === 400);
+  check('and dotdot does not travel',
+    (await j('/v1/images/..%2f..%2fdata%2fapi.db')).status === 400);
+
+  /* ---- the severability switch: one flag, no artwork, data untouched ---- */
+  startApi(IMGOFF_PORT, path.join(TMP, 'imgoff-data'), `http://localhost:${SRC_PORT}`,
+    { noAuth: true, env: { IMAGES_ENABLED: '0' } });
+  await until(async () => (await j('/v1/health', IMGOFF_PORT)).body.catalog === true);
+  check('images off: the endpoint is gone, and says so in a sentence',
+    (await j('/v1/images/en/images/base1/4/low.webp', IMGOFF_PORT)).status === 404);
+  const offCard = (await j('/v1/cards/base1-4?lang=en', IMGOFF_PORT)).body;
+  check('images off: the JSON hands out no artwork addresses at all — an address is distribution too',
+    offCard.images.low === null && offCard.images.high === null &&
+    offCard.printings[0].images.low === null &&
+    (await j('/v1/sets?lang=en', IMGOFF_PORT)).body.sets[0].logo === null);
+  check('images off: the card data is untouched',
+    offCard.name === 'Charizard' && offCard.variants.includes('cracked-ice-holo'));
+
+  /* ---- with bucket credentials, the address is presigned and short-lived ---- */
+  startApi(SIGNED_PORT, path.join(TMP, 'signed-data'), `http://localhost:${SRC_PORT}`, {
+    noAuth: true,
+    env: {
+      R2_ACCOUNT_ID: 'testacct', R2_ACCESS_KEY_ID: 'AKIDEXAMPLE',
+      R2_SECRET_ACCESS_KEY: 'secretsecret', R2_BUCKET: 'cards',
+      CARD_PUBLIC_URL: 'https://api.example.test',
+    },
+  });
+  await until(async () => (await j('/v1/health', SIGNED_PORT)).body.catalog === true);
+  const signed = await fetch(`http://localhost:${SIGNED_PORT}/v1/images/en/images/base1/4/low.webp`, { redirect: 'manual' });
+  const loc = new URL(signed.headers.get('location'));
+  check('with credentials, the address is the private bucket, not the public one',
+    signed.status === 302 && loc.host === 'testacct.r2.cloudflarestorage.com' &&
+    loc.pathname === '/cards/en/images/base1/4/low.webp');
+  check('presigned, host-bound, and it expires',
+    loc.searchParams.get('X-Amz-Algorithm') === 'AWS4-HMAC-SHA256' &&
+    loc.searchParams.get('X-Amz-Expires') === '300' &&
+    loc.searchParams.get('X-Amz-SignedHeaders') === 'host' &&
+    /^[0-9a-f]{64}$/.test(loc.searchParams.get('X-Amz-Signature') || ''));
+  check('a configured public URL makes the JSON addresses absolute',
+    (await j('/v1/cards/base1-4?lang=en', SIGNED_PORT)).body.images.low ===
+      'https://api.example.test/v1/images/en/images/base1/4/low.webp');
 
   /* ---- the master moves on; the API follows by itself ---- */
   buildFixture(master.dbFile, { withNewCard: true });
