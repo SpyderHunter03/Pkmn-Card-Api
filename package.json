@@ -1,0 +1,14 @@
+{
+  "name": "tcg-card-api",
+  "version": "0.1.0",
+  "description": "A standalone card catalog API — the data half of the Pokémon Set Tracker, split out so any application can be a client",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/run-tests.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "license": "MIT"
+}
