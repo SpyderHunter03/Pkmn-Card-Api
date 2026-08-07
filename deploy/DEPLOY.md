@@ -82,8 +82,9 @@ CARD_SOURCE_URL=https://pub-828f8f41b9f543f88ccae1f6ff84c2c5.r2.dev
 CARD_NODE_ID=east
 CARD_PEERS=http://WEST_IP:3400
 CARD_CLUSTER_KEY=<the value from step 3, identical on both>
-# when the bucket goes private (after the tracker-client phase), add the
-# R2_* credentials here — same names publish-images.js uses
+# the bucket is public by standing policy; if it ever must go private
+# (severability), add the R2_* credentials here — same names as
+# publish-images.js
 ```
 
 ## 5. On BOTH boxes — firewall, service, tunnel

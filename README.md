@@ -120,7 +120,9 @@ traffic costs this host a header, not a body:
   `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` — the same names `publish-images.js`
   uses, so an existing `r2.env` works verbatim), the redirect is a
   **presigned URL**, host-bound and valid for `CARD_IMAGE_URL_TTL` seconds
-  (default 300). This is what lets the bucket go private.
+  (default 300). This machinery exists as the severability path — the bucket
+  is public by standing policy, and the presigner waits for a day nobody
+  plans.
 - Without credentials, the redirect points at the public bucket — so this
   phase deploys today, before anything about the bucket changes.
 
@@ -185,12 +187,12 @@ proves the cluster the same way the suite does.
 
 ## What is deliberately not here yet
 
-Payment integration (Phase 5, which will be a webhook onto the same
-provisioning code the CLI uses) — and the bucket itself stays public until
-the tracker has become a client of this API (the tracker-client phase),
-because making it
-private earlier would break every install that still pulls from it directly.
-See [PLAN.md](PLAN.md) for the staging and the reasoning.
+Payment integration (a later phase, which will be a webhook onto the same
+provisioning code the CLI uses). The bucket itself stays **public,
+permanently** — that is policy, not a pending migration: images are free to
+anyone at their bucket URL, token or not, which keeps the artwork
+verifiably outside everything paid. See [PLAN.md](PLAN.md) for the staging
+and the reasoning.
 
 ## A note on what this serves
 

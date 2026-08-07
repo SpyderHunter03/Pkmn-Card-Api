@@ -57,8 +57,14 @@ maintainer workspace ──publish──▶ R2 (catalog.db, catalog.json, images
   applications is not a mode of one of them.
 - A consumer of the published master, serving straight off the pulled
   `catalog.db`. The maintainer workspace does not change at all.
-- The bucket goes private only at the end of the tracker-client phase, when
-  nothing anonymous still needs it.
+- **The bucket stays public, permanently (settled).** Anyone can fetch an
+  image at its bucket URL, token or no token — which makes "we do not sell
+  the artwork" independently verifiable, and matches the field: the free
+  community APIs serve images openly, and even the commercial one (Scrydex)
+  operates on a disclaimer. Money buys data lookups and service, nothing
+  else. Severability is unchanged: a takedown still means bucket → private
+  plus IMAGES_ENABLED=0, and the R2 presign machinery already shipped in
+  Phase 3 is the ready-made path if that day ever comes.
 
 ## Tokens and quotas (Phase 2, design settled)
 
@@ -97,9 +103,10 @@ boot pull plus updates. The tracker's out-of-the-box install story survives.
    exchange, a dead peer takes nothing down, and exchanges are HMAC-signed.
    deploy/DEPLOY.md is the two-Vultr-boxes runbook: one Cloudflare Tunnel,
    replica connectors on both coasts.
-5. **The tracker becomes a client** — token in setup + admin, catalog pull
-   and images rerouted, honest failure messages for missing/revoked/spent.
-   Only after this ships everywhere does the bucket go private.
+5. **The tracker becomes a client** — token in setup + admin, the catalog
+   pull rerouted through the API, honest failure messages for
+   missing/revoked/spent. Images need no rerouting at all now: the bucket is
+   public forever, so installs keep hotlinking exactly as today.
 6. **Billing** — later, deliberately. Attaches to data plans and apps only.
 
 ## Open
