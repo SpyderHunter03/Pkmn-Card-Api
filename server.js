@@ -10,8 +10,11 @@
  * catalog.db when the version moves, and serves straight from that file.
  * The maintainer workspace and its publish flow do not know this exists.
  *
- * Phase 1: the read surface, unauthenticated. Tokens, quotas and metered
- * images arrive in later phases — the data path gets proved on its own first.
+ * Phase 2: the gate is in. Every /v1 endpoint except /v1/health wants a token
+ * (Authorization: Bearer …, or X-API-Key for clients that cannot set it),
+ * requests are weighted — a bulk catalog.db pull is not priced like a card
+ * lookup — and every answer carries X-Quota-* / X-RateLimit-* headers so a
+ * client sees the wall before hitting it. scripts/tokens.js mints the keys.
  *
  * Env:
  *   PORT                    listen port (default 3400)
@@ -21,6 +24,8 @@
  *                           the same value the tracker calls cdnBase
  *   CARD_CHECK_INTERVAL_MS  how often to look for a newer master
  *                           (default 6 hours)
+ *   CARD_REQUIRE_TOKEN      set to 0 to run the surface open (local
+ *                           development; the default is on)
  *
  * Zero dependencies. Node >= 22.5 (node:sqlite).
  */
@@ -42,6 +47,7 @@ const PORT = parseInt(process.env.PORT || '3400', 10);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const SOURCE = (process.env.CARD_SOURCE_URL || '').trim().replace(/\/+$/, '');
 const CHECK_MS = parseInt(process.env.CARD_CHECK_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+const REQUIRE_TOKEN = process.env.CARD_REQUIRE_TOKEN !== '0';
 
 const CAT_FILE = path.join(DATA_DIR, 'catalog.db');
 const CAT_TMP = CAT_FILE + '.tmp';
@@ -52,6 +58,103 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const LANG_RE = /^[a-z]{2}(-[a-z]{2})?$/i;
 const SET_ID_RE = /^[a-zA-Z0-9_.-]{1,60}$/;
 const CARD_ID_RE = /^[a-zA-Z0-9_.-]{1,80}$/;
+
+/* ============================================================
+ * Tokens, quotas, and the burst window
+ *
+ * Who may ask, and how much, lives in api.db — a separate database from the
+ * catalog, because the catalog file is thrown away and replaced whenever the
+ * master moves and the ledger of spend must survive that.
+ *
+ * Monthly counts are durable rows. The burst window is in memory and does
+ * not survive a restart, which is the right trade for a cap measured in
+ * seconds: its job is protecting the host right now, not accounting.
+ * ============================================================ */
+const { openApiDb, sha256, TOKEN_RE, period, periodResetsAt } = require(path.join(__dirname, 'lib', 'apidb'));
+const adb = openApiDb(DATA_DIR);
+const _tokenByHash = adb.prepare('SELECT * FROM tokens WHERE hash = ?');
+const _usageOf = adb.prepare('SELECT count FROM usage WHERE token_id = ? AND period = ?');
+const _charge = adb.prepare(`INSERT INTO usage (token_id, period, count) VALUES (?,?,?)
+  ON CONFLICT(token_id, period) DO UPDATE SET count = count + excluded.count`);
+const _touch = adb.prepare('UPDATE tokens SET last_used = ? WHERE id = ?');
+
+const _burst = new Map();      // token id -> { start, n } for the current minute
+const _touched = new Map();    // token id -> last time last_used was written
+
+function bearerOf(req) {
+  const h = String(req.headers.authorization || '');
+  if (/^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
+  return String(req.headers['x-api-key'] || '').trim();
+}
+
+/** Authenticate and meter one request. Sends the refusal itself and returns
+ * null; otherwise sets the quota headers and returns the token row (or true
+ * when the gate is switched off for local development). */
+function gate(req, res, cost) {
+  if (!REQUIRE_TOKEN) return true;
+  const raw = bearerOf(req);
+  if (!raw) return sendJSON(res, 401, { error: 'A token is required: Authorization: Bearer <token> (or X-API-Key).' }), null;
+  // junk that could never be a token is refused before it costs a lookup
+  const t = TOKEN_RE.test(raw) ? _tokenByHash.get(sha256(raw)) : null;
+  if (!t) return sendJSON(res, 401, { error: 'That token is not recognised.' }), null;
+  if (t.revoked) return sendJSON(res, 403, { error: 'This token has been revoked.' }), null;
+
+  // ---- the burst window: requests per minute, every plan, no exceptions ----
+  const now = Date.now();
+  let w = _burst.get(t.id);
+  if (!w || now - w.start >= 60_000) { w = { start: now, n: 0 }; _burst.set(t.id, w); }
+  const resetIn = Math.max(1, Math.ceil((w.start + 60_000 - now) / 1000));
+  res.setHeader('X-RateLimit-Limit', String(t.burst_limit));
+  res.setHeader('X-RateLimit-Remaining', String(Math.max(0, t.burst_limit - w.n - 1)));
+  res.setHeader('X-RateLimit-Reset', String(resetIn));
+  if (w.n + 1 > t.burst_limit) {
+    return sendJSON(res, 429, { error: `Too many requests — this token is limited to ${t.burst_limit} per minute.` },
+      { 'Retry-After': String(resetIn) }), null;
+  }
+  w.n++;
+
+  // ---- the monthly allowance: durable, weighted by what was asked for ----
+  const per = period();
+  const used = (_usageOf.get(t.id, per) || { count: 0 }).count;
+  res.setHeader('X-Quota-Period', per);
+  if (t.monthly_limit === null) {
+    res.setHeader('X-Quota-Limit', 'unlimited');
+    res.setHeader('X-Quota-Used', String(used + cost));
+  } else {
+    if (used + cost > t.monthly_limit) {
+      res.setHeader('X-Quota-Limit', String(t.monthly_limit));
+      res.setHeader('X-Quota-Used', String(used));
+      res.setHeader('X-Quota-Remaining', '0');
+      return sendJSON(res, 402, {
+        error: `The monthly allowance is spent (${used} of ${t.monthly_limit} requests used). It resets ${periodResetsAt().slice(0, 10)}.`,
+      }), null;
+    }
+    res.setHeader('X-Quota-Limit', String(t.monthly_limit));
+    res.setHeader('X-Quota-Used', String(used + cost));
+    res.setHeader('X-Quota-Remaining', String(t.monthly_limit - used - cost));
+  }
+  if (cost > 0) _charge.run(t.id, per, cost);
+  // last_used is a courtesy for `tokens.js list`, not an audit log — one
+  // write a minute per token, not one per request
+  if ((now - (_touched.get(t.id) || 0)) > 60_000) { _touch.run(now, t.id); _touched.set(t.id, now); }
+  return t;
+}
+
+/* What each ask is worth. Weighting is the whole point: the bulk file and a
+ * single card lookup must not cost the same, the manifest is free so installs
+ * can poll for updates without spending, and images (Phase 3) are free
+ * forever — that one is policy, not economics; see PLAN.md. */
+function costOf(p, req) {
+  if (p === '/v1/catalog.db') return req.headers['if-none-match'] === currentEtag() ? 0 : 100;
+  if (p === '/v1/scan-index') return 5;
+  if (p === '/v1/catalog.json' || p === '/v1/languages' || p === '/v1/me') return 0;
+  if (p === '/v1/sets' || p.startsWith('/v1/sets/') || p === '/v1/cards' || p.startsWith('/v1/cards/')) return 1;
+  return 0;                     // unknown paths get a 404, not a bill
+}
+
+function currentEtag() {
+  return `"v${state.manifest ? state.manifest.version : 0}-${((state.manifest && state.manifest.contentHash) || '').slice(0, 16)}"`;
+}
 
 /* ============================================================
  * The catalog: one SQLite file, pulled from the master, read-only
@@ -290,13 +393,35 @@ const server = http.createServer(async (req, res) => {
   if (req.method !== 'GET') return sendJSON(res, 405, { error: 'Method not allowed' });
 
   try {
+    // the one open endpoint: a monitor should not need a key to ask "alive?"
     if (p === '/v1/health') {
       return sendJSON(res, 200, {
         ok: !!cat,
         catalog: !!cat,
         version: state.manifest ? state.manifest.version : null,
         sourceConfigured: !!SOURCE,
+        auth: REQUIRE_TOKEN,
         checkedAt: state.checkedAt || null,
+      });
+    }
+
+    // everything below the line pays its way
+    const tok = gate(req, res, costOf(p, req));
+    if (!tok) return;
+
+    if (p === '/v1/me') {
+      if (tok === true) return sendJSON(res, 200, { auth: 'disabled' });
+      const used = (_usageOf.get(tok.id, period()) || { count: 0 }).count;
+      return sendJSON(res, 200, {
+        name: tok.name,
+        plan: tok.plan,
+        monthlyLimit: tok.monthly_limit,          // null = unlimited
+        burstLimit: tok.burst_limit,
+        period: period(),
+        used,
+        remaining: tok.monthly_limit === null ? null : Math.max(0, tok.monthly_limit - used),
+        resetsAt: periodResetsAt(),
+        created: tok.created,
       });
     }
 
@@ -308,8 +433,9 @@ const server = http.createServer(async (req, res) => {
     if (p === '/v1/catalog.db') {
       if (!cat) return noCatalog(res);
       // byte-for-byte the published file — tombstones included, because the
-      // installs that pull this still merge by them
-      const etag = `"v${state.manifest ? state.manifest.version : 0}-${(state.manifest && state.manifest.contentHash || '').slice(0, 16)}"`;
+      // installs that pull this still merge by them. A 304 costs nothing:
+      // "you already have it" is not a download.
+      const etag = currentEtag();
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304, { ETag: etag, 'Access-Control-Allow-Origin': '*' });
         return res.end();

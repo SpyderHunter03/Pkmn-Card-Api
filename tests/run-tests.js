@@ -12,7 +12,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
 
 let failCount = 0;
@@ -106,8 +106,11 @@ const mockSrc = http.createServer((req, res) => {
   res.writeHead(404); res.end('nope');
 });
 
+let AUTH = null;   // the token most checks ride on; set once the CLI has minted it
 const j = async (pathAndQuery, port = API_PORT, opts = {}) => {
-  const r = await fetch(`http://localhost:${port}${pathAndQuery}`, opts);
+  const headers = { ...(opts.headers || {}) };
+  if (AUTH && !opts.noAuth && !headers.Authorization && !headers['X-API-Key']) headers.Authorization = 'Bearer ' + AUTH;
+  const r = await fetch(`http://localhost:${port}${pathAndQuery}`, { ...opts, headers });
   let body = null;
   try { body = await r.json(); } catch { /* not JSON */ }
   return { status: r.status, headers: r.headers, body };
@@ -123,7 +126,7 @@ const until = async (fn, ms = 8000) => {
 };
 
 const children = [];
-function startApi(port, dataDir, source) {
+function startApi(port, dataDir, source, { noAuth = false } = {}) {
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
     env: {
       ...process.env,
@@ -131,6 +134,7 @@ function startApi(port, dataDir, source) {
       DATA_DIR: dataDir,
       CARD_SOURCE_URL: source,
       CARD_CHECK_INTERVAL_MS: '300',
+      CARD_REQUIRE_TOKEN: noAuth ? '0' : '1',
     },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
@@ -138,11 +142,24 @@ function startApi(port, dataDir, source) {
   return child;
 }
 
+/* mint a token exactly the way the operator would: through the CLI */
+function mint(dataDir, args) {
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'tokens.js'), ...args],
+    { env: { ...process.env, DATA_DIR: dataDir }, encoding: 'utf8' });
+  const m = (r.stdout || '').match(/ptcg_live_[0-9a-f]{40}/);
+  if (!m) throw new Error('the CLI issued no token:\n' + r.stdout + r.stderr);
+  return m[0];
+}
+const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'tokens.js'), ...args],
+  { env: { ...process.env, DATA_DIR: dataDir }, encoding: 'utf8' }).stdout || '';
+
 (async () => {
   mockSrc.listen(SRC_PORT);
 
-  /* ---- an API with nothing: no catalog on disk, a master that is not there ---- */
-  startApi(API2_PORT, path.join(TMP, 'api2-data'), 'http://localhost:39999');
+  /* ---- an API with nothing: no catalog on disk, a master that is not there.
+   * Runs with the gate off — which is also the check that CARD_REQUIRE_TOKEN=0
+   * exists for local development. ---- */
+  startApi(API2_PORT, path.join(TMP, 'api2-data'), 'http://localhost:39999', { noAuth: true });
   await until(async () => (await j('/v1/health', API2_PORT)).status === 200);
   const bare = await j('/v1/health', API2_PORT);
   const bareSets = await j('/v1/sets?lang=en', API2_PORT);
@@ -150,8 +167,13 @@ function startApi(port, dataDir, source) {
   check('and its data endpoints answer 503, not an empty list',
     bareSets.status === 503 && /master may be unreachable/.test(bareSets.body.error));
 
-  /* ---- the real one: boots, pulls v1, serves ---- */
-  startApi(API_PORT, path.join(TMP, 'api-data'), `http://localhost:${SRC_PORT}`);
+  /* ---- the real one: gated, boots, pulls v1, serves ---- */
+  const apiData = path.join(TMP, 'api-data');
+  AUTH = mint(apiData, ['issue', '--name', 'Set Tracker (test)', '--plan', 'app']);
+  const tokTiny = mint(apiData, ['issue', '--name', 'Tiny allowance', '--plan', 'starter', '--monthly', '3', '--burst', '100']);
+  const tokBurst = mint(apiData, ['issue', '--name', 'Burst-capped unlimited', '--plan', 'unlimited', '--burst', '2']);
+  const tokPull = mint(apiData, ['issue', '--name', 'One pull and a half', '--monthly', '150', '--burst', '100']);
+  startApi(API_PORT, apiData, `http://localhost:${SRC_PORT}`);
   check('the API pulls the catalog on boot',
     await until(async () => (await j('/v1/health')).body.catalog === true));
   check('and reports the master version it holds', (await j('/v1/health')).body.version === 1);
@@ -198,8 +220,55 @@ function startApi(port, dataDir, source) {
   const cors = await j('/v1/sets?lang=en');
   check('browser clients are welcome (CORS on answers)', cors.headers.get('access-control-allow-origin') === '*');
 
+  /* ---- the gate: who may ask, and how much ---- */
+  check('health answers with no token at all — a monitor needs no key',
+    (await j('/v1/health', API_PORT, { noAuth: true })).status === 200);
+  check('everything else refuses a missing token with a sentence, not a hang',
+    (await j('/v1/sets?lang=en', API_PORT, { noAuth: true })).status === 401);
+  check('an invented token is turned away',
+    (await j('/v1/sets?lang=en', API_PORT, { headers: { Authorization: 'Bearer ptcg_live_' + 'f'.repeat(40) } })).status === 401);
+  check('and junk that could never be a token is too',
+    (await j('/v1/sets?lang=en', API_PORT, { headers: { Authorization: 'Bearer hello' } })).status === 401);
+  check('X-API-Key works for clients that cannot set Authorization',
+    (await j('/v1/cards/base1-4?lang=en', API_PORT, { headers: { 'X-API-Key': AUTH } })).status === 200);
+  check('an unlimited token still sees its own weather',
+    cors.headers.get('x-quota-limit') === 'unlimited' && cors.headers.get('x-ratelimit-limit') === '300');
+
+  // a small allowance runs out, and the wall explains itself
+  const tiny = (q) => j(q, API_PORT, { headers: { Authorization: 'Bearer ' + tokTiny } });
+  await tiny('/v1/cards/base1-4?lang=en');
+  await tiny('/v1/cards/base1-7?lang=en');
+  const lastGood = await tiny('/v1/cards/fossil-1?lang=en');
+  check('quota headers count down to the wall',
+    lastGood.headers.get('x-quota-used') === '3' && lastGood.headers.get('x-quota-remaining') === '0');
+  const spent = await tiny('/v1/cards/base1-4?lang=en');
+  check('a spent allowance is a 402 that says when it resets',
+    spent.status === 402 && /resets \d{4}-\d{2}-\d{2}/.test(spent.body.error));
+  check('but the free manifest still answers — polling for updates costs nothing',
+    (await tiny('/v1/catalog.json')).status === 200);
+  const me = await tiny('/v1/me');
+  check('/v1/me tells a token the truth about itself',
+    me.status === 200 && me.body.used === 3 && me.body.remaining === 0 && me.body.plan === 'starter');
+
+  // the burst window guards the host, unlimited plans included
+  const bursty = (q) => j(q, API_PORT, { headers: { Authorization: 'Bearer ' + tokBurst } });
+  await bursty('/v1/cards/base1-4?lang=en');
+  await bursty('/v1/cards/base1-7?lang=en');
+  const walled = await bursty('/v1/cards/fossil-1?lang=en');
+  check('an unlimited plan still hits the per-minute ceiling',
+    walled.status === 429 && parseInt(walled.headers.get('retry-after'), 10) >= 1 &&
+    parseInt(walled.headers.get('retry-after'), 10) <= 60);
+
+  // revocation is immediate, no restart, no cache to wait out
+  const burstId = (cli(apiData, ['list']).match(/#(\d+)[^\n]*Burst-capped/) || [])[1];
+  cli(apiData, ['revoke', burstId]);
+  check('a revoked token gets 403 on its very next request',
+    (await bursty('/v1/me')).status === 403);
+  check('the ledger shows names, plans and spend',
+    /Tiny allowance/.test(cli(apiData, ['list'])) && /REVOKED/.test(cli(apiData, ['list'])));
+
   /* ---- the bulk file: byte-for-byte, tombstones included ---- */
-  const dbRes = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`);
+  const dbRes = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`, { headers: { Authorization: 'Bearer ' + AUTH } });
   const dbBytes = Buffer.from(await dbRes.arrayBuffer());
   const onDisk = fs.readFileSync(path.join(TMP, 'api-data', 'catalog.db'));
   check('catalog.db is served byte-for-byte', dbBytes.equals(onDisk));
@@ -210,8 +279,19 @@ function startApi(port, dataDir, source) {
     pdb.prepare("SELECT hidden FROM cards WHERE lang='en' AND id='base1-99'").get().hidden === 1);
   pdb.close();
   const etag = dbRes.headers.get('etag');
-  const again = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`, { headers: { 'If-None-Match': etag } });
+  const again = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`,
+    { headers: { 'If-None-Match': etag, Authorization: 'Bearer ' + AUTH } });
   check('an install that already has this version is told so in one round trip', again.status === 304);
+
+  /* ---- the pull is priced like the whole database it is ---- */
+  const puller = (q, h = {}) => j(q, API_PORT, { headers: { Authorization: 'Bearer ' + tokPull, ...h } });
+  const pull1 = await fetch(`http://localhost:${API_PORT}/v1/catalog.db`, { headers: { Authorization: 'Bearer ' + tokPull } });
+  check('a bulk pull costs 100, not 1', pull1.status === 200 && pull1.headers.get('x-quota-used') === '100');
+  const mePull = await puller('/v1/me');
+  check('and the spend is durable, visible, and honest', mePull.body.used === 100 && mePull.body.remaining === 50);
+  check('a second pull does not fit in what is left', (await puller('/v1/catalog.db')).status === 402);
+  check('but "you already have it" is free even to a broke token',
+    (await puller('/v1/catalog.db', { 'If-None-Match': etag })).status === 304);
 
   /* ---- the master moves on; the API follows by itself ---- */
   buildFixture(master.dbFile, { withNewCard: true });
@@ -241,6 +321,18 @@ function startApi(port, dataDir, source) {
 
   check('an unknown path is a 404 with an explanation, not a hang',
     (await j('/v1/nothing-here')).status === 404);
+
+  /* ---- the ledger survives what the burst window is allowed to forget ---- */
+  children[1].kill();                                    // the gated API; api2 stays up
+  await new Promise((r) => setTimeout(r, 300));
+  startApi(API_PORT, apiData, `http://localhost:${SRC_PORT}`);
+  check('a restarted API still holds its catalog (the mock is dead by now)',
+    await until(async () => (await j('/v1/health', API_PORT, { noAuth: true })).body.catalog === true));
+  const meAfter = await j('/v1/me', API_PORT, { headers: { Authorization: 'Bearer ' + tokPull } });
+  check('and the monthly spend came back with it — quota is a ledger, not a mood',
+    meAfter.status === 200 && meAfter.body.used === 100);
+  check('while the tiny token is still spent, not refreshed by a reboot',
+    (await j('/v1/cards/base1-4?lang=en', API_PORT, { headers: { Authorization: 'Bearer ' + tokTiny } })).status === 402);
 
   for (const c of children) c.kill();
   fs.rmSync(TMP, { recursive: true, force: true });
