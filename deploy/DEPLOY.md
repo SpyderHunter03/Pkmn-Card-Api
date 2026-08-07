@@ -117,7 +117,7 @@ instead of new tunnels.
 ```bash
 # alive, named, holding cards
 curl -s http://localhost:3400/v1/health
-#   → "ok":true, "node":"east", "catalog":true, "version":…
+#   → "ok":true, "node":"east", "service":"0.4.3", "catalog":true, "version":…
 
 # mint a key — always DATA_DIR (the CLI says which ledger file it opened;
 # believe it), always as the service user (root-owned SQLite sidecar files
@@ -159,6 +159,10 @@ Provision the new box in its region (e.g. Los Angeles or Seattle for a
 `west`), then run **steps 2–4 exactly**, with two differences in the env
 file: its own `CARD_NODE_ID` (say `west`), and hold off on starting the
 service — clustering config comes first.
+
+If push-deploy is set up (Part III), two extra lines belong here: append
+the deploy public key to this box's `/root/.ssh/authorized_keys`, and add
+`west=NEW_IP` to the `DEPLOY_HOSTS` secret once the node is proven.
 
 ## 8. The cluster key — once, ever
 
@@ -247,12 +251,57 @@ sudo -u cardapi DATA_DIR=/var/lib/card-api node scripts/tokens.js revoke $T
 
 # Part III — day two
 
-**Updating** — one node at a time, and the others keep answering; that is
-the point of having more than one:
+## Updating: push to main, and the fleet follows
+
+`.github/workflows/deploy.yml` ships in the repo and does the whole update
+dance on every push to main: the test suite runs on GitHub's runner first
+(no box is touched if it is red), then each node is updated **one at a
+time**, in order. A node only counts as done when its `/v1/health` reports
+exactly the new version — "the process restarted" is not "the new code is
+serving". If a node fails that check, `deploy/deploy-node.sh` rolls it back
+to the commit it was on and the rollout halts, so a failed deploy leaves
+every node on one version — the old one — never a mix. A second push during
+a rollout queues behind it instead of interleaving.
+
+Token counts are never at risk from a deploy or a rollback: the ledger
+lives in `/var/lib/card-api`, outside the repo, and the deploy only ever
+touches `/opt/card-api`.
+
+Two one-time setup steps make it live (until then the workflow runs, says
+there is nothing to deploy to, and exits green):
+
+**1. A deploy key.** On your own machine, generate a keypair used for
+nothing else:
+
+```bash
+ssh-keygen -t ed25519 -f deploy_key -N "" -C "card-api-deploy"
+```
+
+Put the **public** half on **every** node (and on every future node — make
+it part of step 7):
+
+```bash
+cat deploy_key.pub >> /root/.ssh/authorized_keys
+```
+
+**2. Two repository secrets.** GitHub → the repo → Settings → Secrets and
+variables → Actions → New repository secret:
+
+- `DEPLOY_SSH_KEY` — the entire contents of the **private** file
+  `deploy_key`, including the BEGIN/END lines. Then delete the local copy;
+  GitHub holds it now.
+- `DEPLOY_HOSTS` — space-separated `name=ip` entries, e.g.
+  `east=203.0.113.10 west=198.51.100.20`. **The order here is the rollout
+  order.** Adding a node to the cluster (Part II) ends with adding it here.
+
+Watch any rollout under the repo's **Actions** tab; the manual trigger
+("Run workflow") redeploys the current main without a push.
+
+Manual fallback, should GitHub ever be the thing that is down:
 
 ```bash
 cd /opt/card-api && git pull && npm test && systemctl restart card-api
-# check /v1/health, then move to the next node
+# check /v1/health reports the new "service" version, then the next node
 ```
 
 **Tokens** — mint, list, revoke on whichever node is closest; keys and

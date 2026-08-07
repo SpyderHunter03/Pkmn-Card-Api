@@ -410,6 +410,10 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
       const c = (await j('/v1/health', EAST_PORT, { noAuth: true })).body.cluster;
       return c && c[0] && c[0].ok === true;
     }));
+  const pkgVersion = require(path.join(__dirname, '..', 'package.json')).version;
+  check('each node reports its own service version, and its peer\u2019s',
+    (await j('/v1/health', EAST_PORT, { noAuth: true })).body.service === pkgVersion &&
+    (await j('/v1/health', EAST_PORT, { noAuth: true })).body.cluster[0].service === pkgVersion);
 
   // a key minted on one coast works on the other
   const eastTok = mint(eastData, ['issue', '--name', 'Cross-country', '--monthly', '10', '--burst', '100']);

@@ -1,6 +1,6 @@
 {
   "name": "tcg-card-api",
-  "version": "0.4.1",
+  "version": "0.4.3",
   "description": "A standalone card catalog API — the data half of the Pokémon Set Tracker, split out so any application can be a client",
   "main": "server.js",
   "scripts": {

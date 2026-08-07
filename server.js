@@ -74,6 +74,7 @@ try {
   process.exit(1);
 }
 
+const PKG_VERSION = require(path.join(__dirname, 'package.json')).version;
 const PORT = parseInt(process.env.PORT || '3400', 10);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const SOURCE = (process.env.CARD_SOURCE_URL || '').trim().replace(/\/+$/, '');
@@ -291,7 +292,7 @@ function clusterSnapshot() {
   const burst = {};
   const now = Date.now();
   for (const [hash, w] of _burst) if (now - w.start < 60_000 && w.n > 0) burst[hash] = w;
-  return { node: NODE_ID, period: period(), tokens: _allTokenRows.all(), usage, burst };
+  return { node: NODE_ID, service: PKG_VERSION, period: period(), tokens: _allTokenRows.all(), usage, burst };
 }
 
 function applySnapshot(snap) {
@@ -330,7 +331,13 @@ async function syncPeers() {
         headers: { 'Content-Type': 'application/json', 'X-Cluster-Signature': clusterSign(body) },
         body,
       });
-      if (r.ok) { applySnapshot(await r.json()); peerState[peer] = { ok: true, at: Date.now() }; }
+      if (r.ok) {
+        const theirs = await r.json();
+        applySnapshot(theirs);
+        // a peer on a different service version is a deploy in flight — or a
+        // deploy that stalled halfway, which is the one worth seeing
+        peerState[peer] = { ok: true, at: Date.now(), service: theirs.service || null };
+      }
       else peerState[peer] = { ok: false, at: Date.now(), error: 'HTTP ' + r.status };
     } catch (e) {
       // a dead peer must never take this node down with it — serve local,
@@ -630,6 +637,7 @@ const server = http.createServer(async (req, res) => {
         ok: !!cat,
         catalog: !!cat,
         node: NODE_ID,
+        service: PKG_VERSION,
         version: state.manifest ? state.manifest.version : null,
         sourceConfigured: !!SOURCE,
         auth: REQUIRE_TOKEN,

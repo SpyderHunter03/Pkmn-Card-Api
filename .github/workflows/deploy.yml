@@ -1,0 +1,88 @@
+# Push to main → suite runs on GitHub's runner → each node updated IN TURN.
+#
+# The ordering rules this enforces:
+#   - No box is touched until the whole test suite is green on the runner.
+#   - Nodes deploy ONE AT A TIME, in the order they appear in DEPLOY_HOSTS.
+#   - A node only counts as deployed when its /v1/health reports EXACTLY the
+#     new version (deploy/deploy-node.sh does that check on the box).
+#   - If any node fails, that node is rolled back to the commit it was on,
+#     and the rollout HALTS — nodes later in the list are never touched.
+#     Result: a failed deploy leaves every node on ONE version (the old one),
+#     never a mix.
+#   - `concurrency` queues a second push behind a running rollout instead of
+#     letting two rollouts interleave across the fleet.
+#
+# Two repository secrets make it live (Settings → Secrets and variables →
+# Actions); DEPLOY.md Part III walks through creating them:
+#   DEPLOY_SSH_KEY  — private key whose public half is on every node
+#   DEPLOY_HOSTS    — space-separated "name=ip" entries, e.g.
+#                       east=203.0.113.10 west=198.51.100.20
+#                     The order here IS the rollout order.
+# With no secrets set, the deploy job says so and exits green — the workflow
+# is safe to have in the repo before any server exists.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      HOSTS: ${{ secrets.DEPLOY_HOSTS }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH key
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "DEPLOY_SSH_KEY not set — nothing to deploy to. Skipping."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+      - name: Roll out, one node at a time
+        run: |
+          if [ -z "$HOSTS" ]; then
+            echo "DEPLOY_HOSTS not set — nothing to deploy to. Skipping."
+            exit 0
+          fi
+          for entry in $HOSTS; do
+            name="${entry%%=*}"
+            host="${entry#*=}"
+            echo "::group::deploy $name ($host)"
+            if ssh -i ~/.ssh/id_deploy \
+                   -o StrictHostKeyChecking=accept-new \
+                   -o ConnectTimeout=10 \
+                   "root@$host" \
+                   "TARGET_SHA=$SHA bash -s" < deploy/deploy-node.sh; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::$name failed and was rolled back to its previous version. Halting — nodes after it in DEPLOY_HOSTS were NOT touched, so the whole fleet is still on the old version."
+              exit 1
+            fi
+          done
+          echo "All nodes are on $SHA."
