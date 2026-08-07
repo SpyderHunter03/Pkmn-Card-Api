@@ -1,0 +1,26 @@
+# systemd unit for the TCG Card API. Install per DEPLOY.md:
+#   cp deploy/card-api.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now card-api
+[Unit]
+Description=TCG Card API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cardapi
+Group=cardapi
+WorkingDirectory=/opt/card-api
+EnvironmentFile=/etc/card-api/env
+ExecStart=/usr/bin/node /opt/card-api/server.js
+Restart=always
+RestartSec=3
+# the service owns nothing outside its data directory
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/card-api
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

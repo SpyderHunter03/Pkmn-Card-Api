@@ -48,6 +48,10 @@ CARD_SOURCE_URL=https://pub-xxxx.r2.dev PORT=3400 node server.js
 | `IMAGES_ENABLED` | `0` removes all artwork from the API's answers | on |
 | `CARD_IMAGE_URL_TTL` | seconds a presigned image URL lives | `300` |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` / `R2_ENDPOINT` | bucket credentials for presigned URLs (same names as `publish-images.js`) | — |
+| `CARD_NODE_ID` | this node's name in a cluster | hostname |
+| `CARD_PEERS` | comma-separated base URLs of the other nodes | — |
+| `CARD_CLUSTER_KEY` | shared secret peers sign exchanges with (required with peers) | — |
+| `CARD_SYNC_INTERVAL_MS` | how often peers exchange ledgers | `5000` |
 
 Or Docker: `docker build -t tcg-card-api . && docker run -p 3400:3400 -e CARD_SOURCE_URL=… -v carddata:/data tcg-card-api`
 
@@ -141,19 +145,50 @@ one config change, without harming the data product.
 
 Note that `/v1/catalog.db` is byte-for-byte the published file, so image
 locations *inside it* still point at the bucket — consumer installs that
-mirror the database handle their own image serving (that is Phase 4's
-concern, not this endpoint's).
+mirror the database handle their own image serving (that is the
+tracker-client phase's concern, not this endpoint's).
 
 Deleted cards are tombstones in the database (that is how consumer installs
 learn about deletions), but this API never serves a tombstone as if it were a
 card: JSON endpoints show the world as it is, `catalog.db` carries the
 tombstones because the pull protocol needs them.
 
+## Running more than one of it
+
+Set `CARD_PEERS` (and a shared `CARD_CLUSTER_KEY`) on each node and the
+nodes exchange their ledgers every few seconds, POSTing to each other's
+`/v1/cluster/sync` with an HMAC over the exact body. Everything a cluster
+needs rides in that one exchange:
+
+- **Tokens travel.** Mint or revoke on either node; the row replicates by
+  last-write-wins on a monotonic write stamp, so a revocation cannot lose an
+  argument with a fast clock. Only hashes cross the wire — raw tokens never
+  exist anywhere after issue.
+- **The month is one month.** Each node counts its own spend and stores the
+  peers' counts as absolute per-node totals (a grow-only counter — applying
+  the same exchange twice changes nothing). The wall is the sum.
+- **The burst window is one ceiling**, local count plus the peers'
+  last-reported minute.
+- **A dead peer takes nothing with it.** The survivor serves and counts
+  alone, and the ledgers reconcile on the next successful exchange.
+
+Accuracy is stated honestly: enforcement is exact within one sync interval
+(default 5s). A token can overshoot a wall by at most a few seconds of its
+own request rate, once, at the boundary — the price of keeping every request
+local instead of adding a cross-country round trip to each one.
+
+[deploy/DEPLOY.md](deploy/DEPLOY.md) is the copy-paste runbook for the real
+thing: two Vultr boxes (east + west US), one Cloudflare Tunnel with a
+replica connector on each — Cloudflare is the proxy between them, no
+load-balancer product and no open inbound ports — and a smoke test that
+proves the cluster the same way the suite does.
+
 ## What is deliberately not here yet
 
 Payment integration (Phase 5, which will be a webhook onto the same
 provisioning code the CLI uses) — and the bucket itself stays public until
-the tracker has become a client of this API (Phase 4), because making it
+the tracker has become a client of this API (the tracker-client phase),
+because making it
 private earlier would break every install that still pulls from it directly.
 See [PLAN.md](PLAN.md) for the staging and the reasoning.
 

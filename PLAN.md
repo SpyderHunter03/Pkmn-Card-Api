@@ -57,8 +57,8 @@ maintainer workspace ──publish──▶ R2 (catalog.db, catalog.json, images
   applications is not a mode of one of them.
 - A consumer of the published master, serving straight off the pulled
   `catalog.db`. The maintainer workspace does not change at all.
-- The bucket goes private only at the end of Phase 4, when nothing anonymous
-  still needs it.
+- The bucket goes private only at the end of the tracker-client phase, when
+  nothing anonymous still needs it.
 
 ## Tokens and quotas (Phase 2, design settled)
 
@@ -91,10 +91,16 @@ boot pull plus updates. The tracker's out-of-the-box install story survives.
    short-lived once bucket credentials exist, the public bucket until then —
    card JSON points at the API, external URLs pass through untouched, cost
    is 0 on every plan, and IMAGES_ENABLED=0 removes the artwork entirely.
-4. **The tracker becomes a client** — token in setup + admin, catalog pull
+4. **Two homes for one service** — ✅ done. Peer-synced ledgers: tokens
+   replicate (LWW on a monotonic stamp), monthly spend sums across nodes as
+   a grow-only counter, the burst ceiling is cluster-wide within one
+   exchange, a dead peer takes nothing down, and exchanges are HMAC-signed.
+   deploy/DEPLOY.md is the two-Vultr-boxes runbook: one Cloudflare Tunnel,
+   replica connectors on both coasts.
+5. **The tracker becomes a client** — token in setup + admin, catalog pull
    and images rerouted, honest failure messages for missing/revoked/spent.
    Only after this ships everywhere does the bucket go private.
-5. **Billing** — later, deliberately. Attaches to data plans and apps only.
+6. **Billing** — later, deliberately. Attaches to data plans and apps only.
 
 ## Open
 

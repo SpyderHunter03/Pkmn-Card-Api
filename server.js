@@ -16,6 +16,13 @@
  * lookup — and every answer carries X-Quota-* / X-RateLimit-* headers so a
  * client sees the wall before hitting it. scripts/tokens.js mints the keys.
  *
+ * Phase 4: two homes for one service. Set CARD_PEERS and nodes exchange
+ * their ledgers every few seconds — tokens travel (a key minted or revoked
+ * on one coast works or dies on the other), monthly spend is summed across
+ * the cluster, and the burst window sees the peers' last-known minute. Every
+ * request stays local-speed; the price is a sync interval's worth of drift
+ * at the walls, which is the correct trade and is written down honestly.
+ *
  * Phase 3: images, by address. Image locations in served JSON point at this
  * API, and /v1/images answers with a 302 to where the bytes actually live —
  * a presigned bucket URL when credentials are configured, the public bucket
@@ -45,6 +52,11 @@
  *                           names publish-images.js uses, so an existing
  *                           r2.env works verbatim. Without them, image
  *                           redirects point at the public bucket.
+ *   CARD_NODE_ID            this node's name in a cluster (default hostname)
+ *   CARD_PEERS              comma-separated base URLs of the other nodes
+ *   CARD_CLUSTER_KEY        shared secret peers sign their exchanges with —
+ *                           required when CARD_PEERS is set
+ *   CARD_SYNC_INTERVAL_MS   how often peers exchange ledgers (default 5000)
  *
  * Zero dependencies. Node >= 22.5 (node:sqlite).
  */
@@ -80,6 +92,15 @@ const R2 = {
 const R2_SIGNED = !!(R2.key && R2.secret && R2.bucket && (R2.account || R2.endpoint));
 const crypto = require('crypto');
 
+const NODE_ID = (process.env.CARD_NODE_ID || require('os').hostname()).trim();
+const PEERS = (process.env.CARD_PEERS || '').split(',').map((u) => u.trim().replace(/\/+$/, '')).filter(Boolean);
+const CLUSTER_KEY = (process.env.CARD_CLUSTER_KEY || '').trim();
+const SYNC_MS = Math.max(500, parseInt(process.env.CARD_SYNC_INTERVAL_MS || '5000', 10) || 5000);
+if (PEERS.length && !CLUSTER_KEY) {
+  console.error('CARD_PEERS is set but CARD_CLUSTER_KEY is not — peers would have no way to prove themselves to each other.');
+  process.exit(1);
+}
+
 const CAT_FILE = path.join(DATA_DIR, 'catalog.db');
 const CAT_TMP = CAT_FILE + '.tmp';
 const META_FILE = path.join(DATA_DIR, 'meta.json');
@@ -108,9 +129,36 @@ const _usageOf = adb.prepare('SELECT count FROM usage WHERE token_id = ? AND per
 const _charge = adb.prepare(`INSERT INTO usage (token_id, period, count) VALUES (?,?,?)
   ON CONFLICT(token_id, period) DO UPDATE SET count = count + excluded.count`);
 const _touch = adb.prepare('UPDATE tokens SET last_used = ? WHERE id = ?');
+// ---- what the cluster knows ----
+const _allTokenRows = adb.prepare('SELECT name, hash, prefix, plan, monthly_limit, burst_limit, notes, created, revoked, updated FROM tokens');
+const _tokenMerge = adb.prepare(`INSERT INTO tokens (name, hash, prefix, plan, monthly_limit, burst_limit, notes, created, revoked, updated)
+  VALUES (?,?,?,?,?,?,?,?,?,?)
+  ON CONFLICT(hash) DO UPDATE SET name = excluded.name, plan = excluded.plan,
+    monthly_limit = excluded.monthly_limit, burst_limit = excluded.burst_limit,
+    notes = excluded.notes, revoked = excluded.revoked, updated = excluded.updated
+    WHERE excluded.updated > tokens.updated`);
+const _ownUsageOfPeriod = adb.prepare('SELECT t.hash AS hash, u.count AS count FROM usage u JOIN tokens t ON t.id = u.token_id WHERE u.period = ?');
+const _peerUsagePut = adb.prepare(`INSERT INTO peer_usage (node, token_hash, period, count) VALUES (?,?,?,?)
+  ON CONFLICT(node, token_hash, period) DO UPDATE SET count = excluded.count`);
+const _peerUsageSum = adb.prepare("SELECT COALESCE(SUM(count), 0) AS n FROM peer_usage WHERE token_hash = ? AND period = ? AND node <> ?");
 
-const _burst = new Map();      // token id -> { start, n } for the current minute
+const _burst = new Map();      // token hash -> { start, n } for the current minute
+const _peerBurst = new Map();  // token hash -> Map(node -> { start, n }), from the last exchange
 const _touched = new Map();    // token id -> last time last_used was written
+const peerState = {};          // peer url -> { ok, at, error? } for /v1/health
+
+/** What the peers have spent from a token's month, as of the last exchange. */
+const peerSpent = (hash) => _peerUsageSum.get(hash, period(), NODE_ID).n;
+
+/** What the peers' burst windows held, counting only windows still inside
+ * their minute. Approximate by exactly one sync interval, on purpose. */
+function peerBurstN(hash, now) {
+  const nodes = _peerBurst.get(hash);
+  if (!nodes) return 0;
+  let n = 0;
+  for (const w of nodes.values()) if (now - w.start < 60_000) n += w.n;
+  return n;
+}
 
 function bearerOf(req) {
   const h = String(req.headers.authorization || '');
@@ -130,23 +178,28 @@ function gate(req, res, cost) {
   if (!t) return sendJSON(res, 401, { error: 'That token is not recognised.' }), null;
   if (t.revoked) return sendJSON(res, 403, { error: 'This token has been revoked.' }), null;
 
-  // ---- the burst window: requests per minute, every plan, no exceptions ----
+  // ---- the burst window: requests per minute, every plan, no exceptions.
+  // In a cluster the window is the local count plus what the peers reported
+  // in the last exchange — one wall, seen from every coast. ----
   const now = Date.now();
-  let w = _burst.get(t.id);
-  if (!w || now - w.start >= 60_000) { w = { start: now, n: 0 }; _burst.set(t.id, w); }
+  let w = _burst.get(t.hash);
+  if (!w || now - w.start >= 60_000) { w = { start: now, n: 0 }; _burst.set(t.hash, w); }
+  const others = peerBurstN(t.hash, now);
   const resetIn = Math.max(1, Math.ceil((w.start + 60_000 - now) / 1000));
   res.setHeader('X-RateLimit-Limit', String(t.burst_limit));
-  res.setHeader('X-RateLimit-Remaining', String(Math.max(0, t.burst_limit - w.n - 1)));
+  res.setHeader('X-RateLimit-Remaining', String(Math.max(0, t.burst_limit - w.n - others - 1)));
   res.setHeader('X-RateLimit-Reset', String(resetIn));
-  if (w.n + 1 > t.burst_limit) {
+  if (w.n + others + 1 > t.burst_limit) {
     return sendJSON(res, 429, { error: `Too many requests — this token is limited to ${t.burst_limit} per minute.` },
       { 'Retry-After': String(resetIn) }), null;
   }
   w.n++;
 
-  // ---- the monthly allowance: durable, weighted by what was asked for ----
+  // ---- the monthly allowance: durable, weighted by what was asked for.
+  // The ledger is the sum of every node's count — a token's month is one
+  // month, not one month per server. ----
   const per = period();
-  const used = (_usageOf.get(t.id, per) || { count: 0 }).count;
+  const used = (_usageOf.get(t.id, per) || { count: 0 }).count + peerSpent(t.hash);
   res.setHeader('X-Quota-Period', per);
   if (t.monthly_limit === null) {
     res.setHeader('X-Quota-Limit', 'unlimited');
@@ -212,6 +265,95 @@ function presignGet(key) {
 }
 
 const IMG_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]*\.(webp|png|jpe?g)$/;
+
+/* ============================================================
+ * The cluster exchange
+ *
+ * Every few seconds each node POSTs its whole hand to each peer and gets the
+ * peer's back in the same round trip: every token row (hashes, never raw
+ * values), this node's own usage counts for the current month as absolutes,
+ * and its live burst windows. Absolutes, not increments — applying the same
+ * exchange twice changes nothing, arrival order does not matter, and a node
+ * that slept through ten exchanges is caught up by the eleventh.
+ *
+ * Token rows merge by last-write-wins on their write stamp, which is
+ * monotonic per row (lib/apidb.js writeStamp) precisely so a revocation
+ * cannot lose an argument with a fast clock on the minting node.
+ *
+ * Exchanges are signed with HMAC-SHA256 over the exact body using
+ * CARD_CLUSTER_KEY. That key is root-equivalent for the token ledger —
+ * whoever holds it can inject tokens — so it lives in a 0600 env file and
+ * nowhere else.
+ * ============================================================ */
+function clusterSnapshot() {
+  const usage = {};
+  for (const r of _ownUsageOfPeriod.all(period())) usage[r.hash] = r.count;
+  const burst = {};
+  const now = Date.now();
+  for (const [hash, w] of _burst) if (now - w.start < 60_000 && w.n > 0) burst[hash] = w;
+  return { node: NODE_ID, period: period(), tokens: _allTokenRows.all(), usage, burst };
+}
+
+function applySnapshot(snap) {
+  if (!snap || typeof snap !== 'object' || !snap.node || snap.node === NODE_ID) return;
+  for (const t of Array.isArray(snap.tokens) ? snap.tokens : []) {
+    if (typeof t.hash !== 'string' || !/^[0-9a-f]{64}$/.test(t.hash)) continue;
+    _tokenMerge.run(t.name, t.hash, t.prefix, t.plan, t.monthly_limit, t.burst_limit,
+      t.notes ?? null, t.created, t.revoked ? 1 : 0, t.updated || 0);
+  }
+  if (snap.period === period()) {
+    for (const [hash, count] of Object.entries(snap.usage || {})) {
+      if (/^[0-9a-f]{64}$/.test(hash) && Number.isInteger(count) && count >= 0) {
+        _peerUsagePut.run(snap.node, hash, snap.period, count);
+      }
+    }
+  }
+  for (const [hash, w] of Object.entries(snap.burst || {})) {
+    if (!/^[0-9a-f]{64}$/.test(hash) || !w || !Number.isFinite(w.start) || !Number.isInteger(w.n)) continue;
+    let nodes = _peerBurst.get(hash);
+    if (!nodes) { nodes = new Map(); _peerBurst.set(hash, nodes); }
+    nodes.set(snap.node, { start: w.start, n: Math.max(0, w.n) });
+  }
+}
+
+const clusterSign = (body) => crypto.createHmac('sha256', CLUSTER_KEY).update(body).digest('hex');
+
+let _syncing = false;
+async function syncPeers() {
+  if (_syncing || !PEERS.length) return;
+  _syncing = true;
+  for (const peer of PEERS) {
+    try {
+      const body = JSON.stringify(clusterSnapshot());
+      const r = await fetch(peer + '/v1/cluster/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Cluster-Signature': clusterSign(body) },
+        body,
+      });
+      if (r.ok) { applySnapshot(await r.json()); peerState[peer] = { ok: true, at: Date.now() }; }
+      else peerState[peer] = { ok: false, at: Date.now(), error: 'HTTP ' + r.status };
+    } catch (e) {
+      // a dead peer must never take this node down with it — serve local,
+      // reconcile when it comes back
+      peerState[peer] = { ok: false, at: Date.now(), error: e.message };
+    }
+  }
+  _syncing = false;
+}
+
+function readBody(req, limit = 5 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(new Error('Body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
 
 function currentEtag() {
   return `"v${state.manifest ? state.manifest.version : 0}-${((state.manifest && state.manifest.contentHash) || '').slice(0, 16)}"`;
@@ -462,6 +604,23 @@ const server = http.createServer(async (req, res) => {
     });
     return res.end();
   }
+  /* ---- the peers' door, with its own lock ---- */
+  if (p === '/v1/cluster/sync' && req.method === 'POST') {
+    if (!CLUSTER_KEY) return sendJSON(res, 404, { error: 'This install is not clustered.' });
+    try {
+      const body = await readBody(req);
+      const given = String(req.headers['x-cluster-signature'] || '');
+      const want = clusterSign(body);
+      if (given.length !== want.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(want))) {
+        return sendJSON(res, 401, { error: 'That exchange is not signed with this cluster\u2019s key.' });
+      }
+      applySnapshot(JSON.parse(body.toString('utf8')));
+      return sendJSON(res, 200, clusterSnapshot());
+    } catch (e) {
+      return sendJSON(res, 400, { error: e.message || 'Bad exchange' });
+    }
+  }
+
   if (req.method !== 'GET') return sendJSON(res, 405, { error: 'Method not allowed' });
 
   try {
@@ -470,10 +629,12 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, {
         ok: !!cat,
         catalog: !!cat,
+        node: NODE_ID,
         version: state.manifest ? state.manifest.version : null,
         sourceConfigured: !!SOURCE,
         auth: REQUIRE_TOKEN,
         checkedAt: state.checkedAt || null,
+        cluster: PEERS.length ? PEERS.map((u) => ({ url: u, ...(peerState[u] || { ok: false }) })) : undefined,
       });
     }
 
@@ -483,8 +644,9 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/v1/me') {
       if (tok === true) return sendJSON(res, 200, { auth: 'disabled' });
-      const used = (_usageOf.get(tok.id, period()) || { count: 0 }).count;
+      const used = (_usageOf.get(tok.id, period()) || { count: 0 }).count + peerSpent(tok.hash);
       return sendJSON(res, 200, {
+        node: NODE_ID,
         name: tok.name,
         plan: tok.plan,
         monthlyLimit: tok.monthly_limit,          // null = unlimited
@@ -633,6 +795,11 @@ server.listen(PORT, () => {
 
 checkForUpdate('boot');
 setInterval(() => checkForUpdate('scheduled'), Math.max(CHECK_MS, 5_000));
+if (PEERS.length) {
+  console.log(`Clustered as "${NODE_ID}" with ${PEERS.length} peer${PEERS.length === 1 ? '' : 's'}: ${PEERS.join(', ')}`);
+  syncPeers();
+  setInterval(syncPeers, SYNC_MS);
+}
 // no catalog is an outage, not a schedule: retry hard until the first one lands
 const bootRetry = setInterval(() => {
   if (cat) { clearInterval(bootRetry); return; }

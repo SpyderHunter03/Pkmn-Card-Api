@@ -24,6 +24,9 @@ const API_PORT = 3491;
 const API2_PORT = 3492;
 const IMGOFF_PORT = 3493;
 const SIGNED_PORT = 3494;
+const EAST_PORT = 3495;
+const WEST_PORT = 3496;
+const CLUSTER_KEY = 'a-test-cluster-key';
 const IMG = `http://localhost:${SRC_PORT}`;   // fixture image URLs live under the mock master
 
 /* ---- fixture: a published catalog.db, exactly as the publisher writes it ---- */
@@ -375,6 +378,91 @@ const cli = (dataDir, args) => spawnSync(process.execPath, [path.join(__dirname,
   check('a configured public URL makes the JSON addresses absolute',
     (await j('/v1/cards/base1-4?lang=en', SIGNED_PORT)).body.images.low ===
       'https://api.example.test/v1/images/en/images/base1/4/low.webp');
+
+  /* ---- two homes for one service: the cluster ----
+   * Two nodes, two data directories, one wall. Everything here is the
+   * distributed question: does a token minted on one coast work on the
+   * other, and is a limit one limit rather than one per server? ---- */
+  const eastData = path.join(TMP, 'east-data');
+  const westData = path.join(TMP, 'west-data');
+  const clusterEnv = (me, peerPort) => ({
+    CARD_NODE_ID: me,
+    CARD_PEERS: `http://localhost:${peerPort}`,
+    CARD_CLUSTER_KEY: CLUSTER_KEY,
+    CARD_SYNC_INTERVAL_MS: '300',
+  });
+  startApi(EAST_PORT, eastData, `http://localhost:${SRC_PORT}`, { env: clusterEnv('east', WEST_PORT) });
+  const westChild = startApi(WEST_PORT, westData, `http://localhost:${SRC_PORT}`, { env: clusterEnv('west', EAST_PORT) });
+  await until(async () => (await j('/v1/health', EAST_PORT, { noAuth: true })).body.catalog === true);
+  await until(async () => (await j('/v1/health', WEST_PORT, { noAuth: true })).body.catalog === true);
+  check('each node knows its own name',
+    (await j('/v1/health', EAST_PORT, { noAuth: true })).body.node === 'east' &&
+    (await j('/v1/health', WEST_PORT, { noAuth: true })).body.node === 'west');
+  check('and health shows the peer once an exchange has landed',
+    await until(async () => {
+      const c = (await j('/v1/health', EAST_PORT, { noAuth: true })).body.cluster;
+      return c && c[0] && c[0].ok === true;
+    }));
+
+  // a key minted on one coast works on the other
+  const eastTok = mint(eastData, ['issue', '--name', 'Cross-country', '--monthly', '10', '--burst', '100']);
+  const onWest = (q, tok = eastTok, opts = {}) => j(q, WEST_PORT, { headers: { Authorization: 'Bearer ' + tok }, ...opts });
+  const onEast = (q, tok = eastTok, opts = {}) => j(q, EAST_PORT, { headers: { Authorization: 'Bearer ' + tok }, ...opts });
+  check('a token minted on the east coast is honored on the west',
+    await until(async () => (await onWest('/v1/me')).status === 200));
+
+  // one month, not one month per server
+  for (let i = 0; i < 6; i++) await onEast('/v1/cards/base1-4?lang=en');
+  check('spend made in the east is visible from the west',
+    await until(async () => ((await onWest('/v1/me')).body || {}).used === 6));
+  for (let i = 0; i < 4; i++) await onWest('/v1/cards/base1-7?lang=en');
+  check('the allowance is one wall, not one per server',
+    (await onWest('/v1/cards/base1-4?lang=en')).status === 402);
+  check('and the east agrees once the ledgers have crossed',
+    await until(async () => ((await onEast('/v1/me')).body || {}).used === 10) &&
+    (await onEast('/v1/cards/base1-4?lang=en')).status === 402);
+
+  // the burst window is shared the same way, within one exchange of drift
+  const burstTok = mint(eastData, ['issue', '--name', 'Coast-to-coast burst', '--plan', 'unlimited', '--burst', '5']);
+  check('the burst token crossed over first',
+    await until(async () => (await onWest('/v1/me', burstTok)).status === 200));
+  // that /v1/me probe on the west counted once; spend three in the east
+  for (let i = 0; i < 3; i++) await onEast('/v1/languages', burstTok);
+  // wait for the east's window to reach the west, without touching the token
+  await new Promise((r) => setTimeout(r, 900));
+  const w1 = await onWest('/v1/languages', burstTok);      // west window: 1 probe + this = 2, east 3 → at the wall
+  const w2 = await onWest('/v1/languages', burstTok);      // 2 + 1 + 3 = 6 > 5
+  check('a burst cap is one ceiling for the whole cluster',
+    w1.status === 200 && w2.status === 429 && (w2.headers.get('retry-after') || '') !== '');
+
+  // revocation crosses the country too — minted east, killed west
+  const westList = cli(westData, ['list']);
+  const westId = (westList.match(new RegExp('#(\\d+)\\s+' + eastTok.slice(0, 16))) || [])[1];
+  check('the west can even see it in its own ledger', !!westId);
+  cli(westData, ['revoke', westId]);
+  check('a revocation on one coast lands on the other',
+    await until(async () => (await onEast('/v1/me')).status === 403));
+
+  // the peers' door has its own lock
+  const forged = await fetch(`http://localhost:${EAST_PORT}/v1/cluster/sync`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Cluster-Signature': 'f'.repeat(64) },
+    body: JSON.stringify({ node: 'mallory', tokens: [], usage: {}, burst: {} }),
+  });
+  check('an exchange without the cluster key is turned away', forged.status === 401);
+
+  // one coast going dark must not take the other with it
+  westChild.kill();
+  await new Promise((r) => { if (westChild.exitCode !== null) return r(); westChild.once('exit', r); });
+  // probed with a key the east actually holds — the suite's main token lives
+  // in a different install's ledger, and the east refusing it is correctness
+  const soloTok = mint(eastData, ['issue', '--name', 'Alone on the coast', '--plan', 'app']);
+  check('the east keeps serving with the west gone',
+    (await onEast('/v1/sets?lang=en', soloTok)).status === 200);
+  check('and says so instead of pretending',
+    await until(async () => {
+      const c = (await j('/v1/health', EAST_PORT, { noAuth: true })).body.cluster;
+      return c && c[0] && c[0].ok === false;
+    }));
 
   /* ---- the master moves on; the API follows by itself ---- */
   buildFixture(master.dbFile, { withNewCard: true });
